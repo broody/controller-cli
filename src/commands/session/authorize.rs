@@ -129,7 +129,16 @@ pub async fn execute(
     overwrite: bool,
     account: Option<&str>,
     expires: &str,
+    username: Option<String>,
 ) -> Result<()> {
+    // If --username is provided, use password-based headless auth
+    if let Some(username) = username {
+        return execute_password_auth(
+            config, formatter, preset, file, chain_id, rpc_url, account, expires, &username,
+        )
+        .await;
+    }
+
     // Validate that either preset or file is provided
     if preset.is_none() && file.is_none() {
         return Err(CliError::InvalidInput(
@@ -680,6 +689,240 @@ fn store_session_from_api(
         .set_controller(&chain_id, address, controller_metadata)
         .map_err(|e| CliError::Storage(e.to_string()))?;
 
+    Ok(())
+}
+
+/// Password-based headless session authorization.
+///
+/// Authenticates via `Controller::from_password()` — decrypts the owner's
+/// encrypted private key from Cartridge's API using the provided password,
+/// creates a session locally, and stores it in the same format as browser-based auth.
+#[allow(clippy::too_many_arguments)]
+async fn execute_password_auth(
+    config: &Config,
+    formatter: &dyn OutputFormatter,
+    preset: Option<String>,
+    file: Option<String>,
+    chain_id: Option<String>,
+    rpc_url: Option<String>,
+    account: Option<&str>,
+    expires: &str,
+    username: &str,
+) -> Result<()> {
+    use account_sdk::controller::Controller;
+    use account_sdk::storage::{StorageBackend, StorageValue};
+
+    // Resolve RPC URL
+    let resolved_rpc_url = if let Some(ref chain_id_str) = chain_id {
+        match chain_id_str.as_str() {
+            "SN_MAIN" => "https://api.cartridge.gg/x/starknet/mainnet".to_string(),
+            "SN_SEPOLIA" => "https://api.cartridge.gg/x/starknet/sepolia".to_string(),
+            _ => {
+                return Err(CliError::InvalidInput(format!(
+                    "Unsupported chain ID '{chain_id_str}'. Supported: SN_MAIN, SN_SEPOLIA"
+                )));
+            }
+        }
+    } else if let Some(ref url) = rpc_url {
+        url.clone()
+    } else if config.session.rpc_url_explicitly_set {
+        config.session.rpc_url.clone()
+    } else {
+        formatter.warning("No --chain-id or --rpc-url specified, using SN_SEPOLIA by default");
+        config.session.rpc_url.clone()
+    };
+
+    // Prompt for password (never a CLI flag — avoid shell history)
+    let password = rpassword::prompt_password("Password: ")
+        .map_err(|e| CliError::InvalidInput(format!("failed to read password: {e}")))?;
+
+    formatter.info(&format!("Authenticating as '{username}'..."));
+
+    // Set storage path so Controller's internal FileSystemBackend uses it
+    let storage_path = config.resolve_storage_path(account);
+    if account.is_some() {
+        std::fs::create_dir_all(&storage_path)
+            .map_err(|e| CliError::Storage(format!("Failed to create account directory: {e}")))?;
+    }
+    std::env::set_var(
+        "CARTRIDGE_STORAGE_PATH",
+        storage_path.to_string_lossy().as_ref(),
+    );
+
+    let rpc_url_parsed = url::Url::parse(&resolved_rpc_url)
+        .map_err(|e| CliError::InvalidInput(format!("Invalid RPC URL: {e}")))?;
+
+    // The SDK's API client appends "/query" internally, so pass the base URL.
+    // The CLI config stores the full URL (e.g. "https://api.cartridge.gg/query"),
+    // but the SDK expects the base (e.g. "https://api.cartridge.gg").
+    let api_base_url = config
+        .session
+        .api_url
+        .strip_suffix("/query")
+        .unwrap_or(&config.session.api_url);
+
+    // Authenticate with password — decrypts owner key, creates Controller
+    let mut controller =
+        Controller::from_password(username, &password, rpc_url_parsed, api_base_url)
+            .await
+            .map_err(|e| CliError::ApiError(format!("authentication failed: {e}")))?;
+
+    formatter.info(&format!(
+        "Authenticated. Controller address: 0x{:x}",
+        controller.address
+    ));
+
+    // Parse expiration
+    let expires_at = parse_expiration(expires)?;
+    formatter.info(&format!("Session expiration: {expires}"));
+
+    // Load policies and create session
+    let policy_file: Option<PolicyFile> = if let Some(preset_name) = preset {
+        let preset_config = crate::presets::fetch_preset(&preset_name).await?;
+
+        let provider = starknet::providers::jsonrpc::JsonRpcClient::new(
+            starknet::providers::jsonrpc::HttpTransport::new(
+                url::Url::parse(&resolved_rpc_url)
+                    .map_err(|e| CliError::InvalidInput(format!("Invalid RPC URL: {e}")))?,
+            ),
+        );
+        let chain_id_felt = starknet::providers::Provider::chain_id(&provider)
+            .await
+            .map_err(|e| CliError::InvalidInput(format!("Failed to query chain_id: {e}")))?;
+        let chain_name = starknet::core::utils::parse_cairo_short_string(&chain_id_felt)
+            .unwrap_or_else(|_| format!("0x{chain_id_felt:x}"));
+
+        let chain_policies =
+            crate::presets::extract_chain_policies(&preset_config, &chain_name, &preset_name)?;
+
+        let contracts = chain_policies
+            .contracts
+            .into_iter()
+            .map(|(addr, contract)| {
+                (
+                    addr,
+                    ContractPolicy {
+                        name: Some(contract.name),
+                        methods: contract
+                            .methods
+                            .into_iter()
+                            .map(|m| MethodPolicy {
+                                name: m.name,
+                                entrypoint: m.entrypoint,
+                                description: m.description,
+                                amount: None,
+                                authorized: true,
+                            })
+                            .collect(),
+                    },
+                )
+            })
+            .collect();
+
+        Some(PolicyFile {
+            contracts,
+            messages: chain_policies.messages,
+        })
+    } else if let Some(file_path) = file {
+        let content = std::fs::read_to_string(&file_path)
+            .map_err(|e| CliError::InvalidInput(format!("Failed to read policy file: {e}")))?;
+        Some(
+            serde_json::from_str(&content)
+                .map_err(|e| CliError::InvalidInput(format!("Invalid policy file: {e}")))?,
+        )
+    } else {
+        None
+    };
+
+    formatter.info("Creating session...");
+
+    if let Some(ref pf) = policy_file {
+        // Build Policy vector (sorted to match frontend canonical ordering)
+        let mut policy_vec = Vec::new();
+        let mut sorted_contracts: Vec<_> = pf.contracts.iter().collect();
+        sorted_contracts.sort_by(|(a, _), (b, _)| a.to_lowercase().cmp(&b.to_lowercase()));
+
+        for (address_str, contract) in &sorted_contracts {
+            let address = starknet::core::types::Felt::from_hex(address_str)
+                .map_err(|e| CliError::InvalidInput(format!("Invalid contract address: {e}")))?;
+
+            let mut sorted_methods = contract.methods.clone();
+            sorted_methods.sort_by(|a, b| a.entrypoint.cmp(&b.entrypoint));
+
+            for method in &sorted_methods {
+                let selector = starknet::core::utils::get_selector_from_name(&method.entrypoint)
+                    .map_err(|e| {
+                        CliError::InvalidInput(format!(
+                            "Invalid entrypoint {}: {e}",
+                            method.entrypoint
+                        ))
+                    })?;
+                policy_vec.push(account_sdk::account::session::policy::Policy::new_call(
+                    address, selector,
+                ));
+            }
+        }
+
+        let total_contracts = pf.contracts.len();
+        let total_entrypoints: usize = pf.contracts.values().map(|c| c.methods.len()).sum();
+        formatter.info(&format!(
+            "Policies: {total_contracts} contracts, {total_entrypoints} entrypoints"
+        ));
+
+        let _session = controller
+            .create_session(policy_vec, expires_at)
+            .await
+            .map_err(|e| CliError::ApiError(format!("Failed to create session: {e}")))?;
+    } else {
+        formatter.warning("No policies specified — creating wildcard session");
+        let _session = controller
+            .create_wildcard_session(expires_at)
+            .await
+            .map_err(|e| CliError::ApiError(format!("Failed to create session: {e}")))?;
+    };
+
+    // Store extra metadata that execute/status commands expect
+    let mut backend =
+        account_sdk::storage::filestorage::FileSystemBackend::new(storage_path.clone());
+
+    // Store controller metadata
+    backend
+        .set_controller(
+            &controller.chain_id,
+            controller.address,
+            account_sdk::storage::ControllerMetadata::from(&controller),
+        )
+        .map_err(|e| CliError::Storage(e.to_string()))?;
+
+    let chain_id_str = starknet::core::utils::parse_cairo_short_string(&controller.chain_id)
+        .unwrap_or_else(|_| format!("0x{:x}", controller.chain_id));
+
+    // Store policies for status command
+    if let Some(ref pf) = policy_file {
+        let policies_storage = PolicyStorage {
+            contracts: pf.contracts.clone(),
+        };
+        let policies_json = serde_json::to_string(&policies_storage)
+            .map_err(|e| CliError::Storage(format!("Failed to serialize policies: {e}")))?;
+        backend
+            .set("session_policies", &StorageValue::String(policies_json))
+            .map_err(|e| CliError::Storage(e.to_string()))?;
+    }
+
+    if config.cli.json_output {
+        formatter.success(&serde_json::json!({
+            "message": "Session authorized via password and stored successfully",
+            "username": username,
+            "address": format!("0x{:x}", controller.address),
+            "chain_id": chain_id_str,
+        }));
+    } else {
+        formatter.info("Session authorized and stored successfully.");
+        formatter.info(&format!("Address: 0x{:x}", controller.address));
+        formatter.info(&format!("Chain: {chain_id_str}"));
+    }
+
+    // Owner key is dropped here
     Ok(())
 }
 

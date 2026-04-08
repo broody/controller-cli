@@ -390,6 +390,10 @@ enum SessionCommands {
         /// Defaults to 7days
         #[arg(long, default_value = "7days")]
         expires: String,
+
+        /// Authenticate with password (headless, no browser). Requires --username.
+        #[arg(long)]
+        username: Option<String>,
     },
 
     /// Display current session status and information
@@ -461,6 +465,7 @@ async fn main() {
                 rpc_url,
                 overwrite,
                 expires,
+                username,
             } => {
                 commands::session::authorize::execute(
                     &config,
@@ -472,6 +477,7 @@ async fn main() {
                     overwrite,
                     account.as_deref(),
                     &expires,
+                    username,
                 )
                 .await
             }
