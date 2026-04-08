@@ -1,11 +1,5 @@
-use crate::{
-    config::Config,
-    error::{CliError, Result},
-    output::OutputFormatter,
-};
-use account_sdk::storage::{
-    filestorage::FileSystemBackend, Credentials, StorageBackend, StorageValue,
-};
+use crate::{config::Config, error::Result, output::OutputFormatter};
+use account_sdk::storage::{filestorage::FileSystemBackend, StorageBackend, StorageValue};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
@@ -108,49 +102,30 @@ pub async fn execute(
                         entries
                     });
 
-                let session_key_guid =
-                    backend
-                        .get("session_key_guid")
-                        .ok()
-                        .flatten()
-                        .and_then(|v| match v {
-                            StorageValue::String(s) => Some(s),
-                            _ => None,
-                        });
+                // Read session key guid and public key from session metadata
+                let guid = format!("0x{:x}", metadata.session.inner.session_key_guid);
 
-                match session_key_guid {
-                    Some(guid) => {
-                        let public_key = match backend.get("session_signer") {
-                            Ok(Some(StorageValue::String(data))) => {
-                                let credentials: Credentials = serde_json::from_str(&data)
-                                    .map_err(|e| CliError::InvalidSessionData(e.to_string()))?;
-                                let signing_key = starknet::signers::SigningKey::from_secret_scalar(
-                                    credentials.private_key,
-                                );
-                                format!("0x{:x}", signing_key.verifying_key().scalar())
-                            }
-                            _ => String::new(),
-                        };
+                let public_key = metadata
+                    .credentials
+                    .as_ref()
+                    .map(|creds| {
+                        let signing_key =
+                            starknet::signers::SigningKey::from_secret_scalar(creds.private_key);
+                        format!("0x{:x}", signing_key.verifying_key().scalar())
+                    })
+                    .unwrap_or_default();
 
-                        Some(SessionInfo {
-                            guid,
-                            public_key,
-                            address,
-                            chain_id,
-                            expires_at,
-                            expires_in_seconds: expires_in,
-                            expires_at_formatted: expires_at_dt
-                                .format("%Y-%m-%d %H:%M:%S UTC")
-                                .to_string(),
-                            is_expired,
-                            policies,
-                        })
-                    }
-                    None => {
-                        formatter.warning("Session data is outdated. Run 'controller session auth' to create a new session.");
-                        None
-                    }
-                }
+                Some(SessionInfo {
+                    guid,
+                    public_key,
+                    address,
+                    chain_id,
+                    expires_at,
+                    expires_in_seconds: expires_in,
+                    expires_at_formatted: expires_at_dt.format("%Y-%m-%d %H:%M:%S UTC").to_string(),
+                    is_expired,
+                    policies,
+                })
             }
             _ => None,
         }
